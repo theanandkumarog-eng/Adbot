@@ -1,0 +1,171 @@
+import os
+import asyncio
+from pyrogram import filters
+from pyrogram.enums import ParseMode
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.errors import RPCError
+from telethon import TelegramClient
+from telethon.errors import AuthKeyUnregisteredError
+
+from Nexa.bot import bot
+from config import SESSION_DIR, API_ID, API_HASH
+from Nexa.database.users import users_db
+
+def normalize_phone(phone: str):
+    return str(phone).replace("+", "").replace(".session", "").strip()
+
+def get_base_session_path(user_id: int, session_name: str):
+    session_name = normalize_phone(session_name)
+    return os.path.join(SESSION_DIR, f"{user_id}_{session_name}")
+
+def get_session_file(user_id: int, session_name: str):
+    return get_base_session_path(user_id, session_name) + ".session"
+
+async def check_status(user_id: int, session_name: str):
+    user = await users_db.find_one({"_id": user_id})
+    status_map = user.get("account_status", {}) if user else {}
+    
+    session_name_clean = normalize_phone(session_name)
+    
+    if status_map.get(session_name_clean) == "inactive":
+        return "Inactive", "❌"
+    
+    base_path = get_base_session_path(user_id, session_name_clean)
+    session_file = base_path + ".session"
+    
+    if not os.path.exists(session_file):
+        await users_db.update_one(
+            {"_id": user_id},
+            {"$set": {f"account_status.{session_name_clean}": "inactive"}}
+        )
+        return "Inactive", "❌"
+    
+    client = None
+    try:
+        client = TelegramClient(base_path, API_ID, API_HASH)
+        await client.connect()
+        
+        if not await client.is_user_authorized():
+            await users_db.update_one(
+                {"_id": user_id},
+                {"$set": {f"account_status.{session_name_clean}": "inactive"}}
+            )
+            return "Inactive", "❌"
+        
+        await users_db.update_one(
+            {"_id": user_id},
+            {"$set": {f"account_status.{session_name_clean}": "active"}}
+        )
+        return "Active", "✅"
+    
+    except AuthKeyUnregisteredError:
+        await users_db.update_one(
+            {"_id": user_id},
+            {"$set": {f"account_status.{session_name_clean}": "inactive"}}
+        )
+        return "Inactive", "❌"
+    
+    except Exception:
+        return "Inactive", "❌"
+    
+    finally:
+        if client:
+            try:
+                await client.disconnect()
+            except:
+                pass
+
+@bot.on_callback_query(filters.regex("^delete_accounts$"))
+async def delete_accounts_menu(client, query):
+    await query.answer()
+    user_id = query.from_user.id
+    
+    user = await users_db.find_one({"_id": user_id})
+    accounts = user.get("accounts", []) if user else []
+    
+    if not accounts:
+        text = "╰_╯ <b>NO ACCOUNTS TO DELETE</b>\n\nAdd an account to start Advertising!"
+        buttons = [[
+            InlineKeyboardButton("Add Account", callback_data="host_account"),
+            InlineKeyboardButton("Back", callback_data="dashboard")
+        ]]
+        return await safe_edit(query, text, buttons)
+    
+    text = "╰_╯ <b>DELETE ACCOUNTS</b>\n\n"
+    buttons = []
+    
+    status_tasks = [check_status(user_id, acc) for acc in accounts]
+    statuses = await asyncio.gather(*status_tasks, return_exceptions=True)
+    
+    for idx, (session_name, status_info) in enumerate(zip(accounts, statuses), start=1):
+        if isinstance(status_info, Exception):
+            status, emoji = "Inactive", "❌"
+        else:
+            status, emoji = status_info
+        
+        phone = f"+{normalize_phone(session_name)}"
+        text += f"{idx}. {phone} - {status} {emoji}\n"
+        
+        buttons.append([
+            InlineKeyboardButton(f"{phone} ({status} {emoji})", callback_data="ignore"),
+            InlineKeyboardButton("Delete", callback_data=f"delete_{normalize_phone(session_name)}")
+        ])
+    
+    text += "\nChoose an account to delete:"
+    buttons.append([
+        InlineKeyboardButton("Back", callback_data="view_accounts")
+    ])
+    
+    await safe_edit(query, text, buttons)
+
+@bot.on_callback_query(filters.regex(r"^delete_(.+)$"))
+async def delete_account(client, query):
+    await query.answer()
+    user_id = query.from_user.id
+    session_name = query.data.split("_", 1)[1]
+    
+    session_file = get_session_file(user_id, session_name)
+    
+    if os.path.exists(session_file):
+        try:
+            os.remove(session_file)
+        except:
+            pass
+    
+    await users_db.update_one(
+        {"_id": user_id},
+        {
+            "$pull": {"accounts": session_name},
+            "$unset": {f"account_status.{session_name}": ""}
+        }
+    )
+    
+    text = "<b>Account deleted!</b>\n\nAccount removed successfully. ✅"
+    buttons = [[InlineKeyboardButton("Back", callback_data="view_accounts")]]
+    
+    await safe_edit(query, text, buttons)
+
+async def safe_edit(query, text, buttons):
+    try:
+        keyboard = InlineKeyboardMarkup(buttons)
+        if hasattr(query.message, 'photo') and query.message.photo:
+            await query.message.edit_caption(
+                caption=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard
+            )
+        else:
+            await query.message.edit_text(
+                text=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard
+            )
+    except RPCError:
+        try:
+            await query.message.reply_text(
+                text=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
+        except:
+            pass
